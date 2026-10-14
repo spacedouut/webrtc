@@ -960,7 +960,10 @@ where
                     break;
                 };
                 if matches!(evt, PeerConnectionDriverEvent::IceGathering)
-                    && self.inner.ice_restart_rebind_pending.load(Ordering::Acquire)
+                    && self
+                        .inner
+                        .ice_restart_rebind_pending
+                        .load(Ordering::Acquire)
                 {
                     deferred_driver_event = Some(evt);
                     break;
