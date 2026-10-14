@@ -622,6 +622,7 @@ where
         // amortizes the per-iteration cost (poll_writes/events/reads core locks,
         // timeout recompute, select setup).
         const MAX_UDP_RECV_BURST: usize = 64;
+        const MAX_DRIVER_EVENT_BURST: usize = APPLICATION_TO_DRIVER_EVENT_CHANNEL_CAPACITY;
         // The burst buffer is shared across sockets, so size it for the largest GRO
         // capacity among them (falls back to the plain size when none support GRO).
         let burst_buf_len = udp_socket_list
@@ -630,6 +631,10 @@ where
             .max()
             .unwrap_or(UDP_RECV_BUF_LEN);
         let mut burst_buf = vec![0u8; burst_buf_len];
+
+        // An `IceGathering` pulled off the channel while draining a burst, handed to the
+        // next `select!` so it still goes through the ICE-restart rebind in that arm.
+        let mut deferred_driver_event: Option<PeerConnectionDriverEvent> = None;
 
         loop {
             // Shutdown safety-net. `close()`/`Drop` set this flag and best-effort
@@ -754,6 +759,11 @@ where
             .into();
             futures::pin_mut!(tcp_read_future);
 
+            let driver_event_future = match deferred_driver_event.take() {
+                Some(evt) => futures::future::ready(Some(evt)).left_future(),
+                None => driver_event_rx.recv().right_future(),
+            };
+
             // Runtime-agnostic select!
             futures::select! {
                 // A blocked consumer freed a slot: hand over what was retained, now.
@@ -765,7 +775,7 @@ where
                 }
 
                 // Driver events (RTP, RTCP, or ICE candidate)
-                evt = driver_event_rx.recv().fuse() => {
+                evt = driver_event_future.fuse() => {
                     if let Some(evt) = evt {
                         // Rebind before the gathering it must precede. `IceGathering` is the
                         // message that starts a generation gathering, so an ICE restart that
@@ -936,6 +946,30 @@ where
                         }
                     }
                 }
+            }
+
+            // Batch-drain application events (RTP from local tracks, RTCP, write pokes)
+            // that queued while this iteration ran. A video frame arrives as a burst of
+            // `SenderRtp` events; handling them one per loop iteration pays the whole
+            // poll/select round and a lone `send_to` per packet, and never builds a run
+            // long enough for GSO. Draining them here lets the next `poll_writes` flush
+            // the whole burst at once.
+            let mut drained = 0;
+            while drained < MAX_DRIVER_EVENT_BURST {
+                let Ok(evt) = driver_event_rx.try_recv() else {
+                    break;
+                };
+                if matches!(evt, PeerConnectionDriverEvent::IceGathering)
+                    && self.inner.ice_restart_rebind_pending.load(Ordering::Acquire)
+                {
+                    deferred_driver_event = Some(evt);
+                    break;
+                }
+                if self.handle_driver_event(evt).await {
+                    trace!("Driver event channel closed, exiting event loop");
+                    return Ok(());
+                }
+                drained += 1;
             }
         }
     }
